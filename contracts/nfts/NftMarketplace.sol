@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./extentions/MarketPlatform.sol";
-import { IFactory } from "./NftFactory.sol";
+import "./interfaces/IMarketPlatform.sol";
+import "./interfaces/IFactory.sol";
 import { IRoyalty } from "@thirdweb-dev/contracts/extension/interface/IRoyalty.sol";
 
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
@@ -153,19 +153,7 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     listedNft.sold = true;
 
     uint256 totalPrice = listedNft.price;
-    (address royaltyRecipient, uint256 royaltyFee) = getRoyalty(_nft);
-
-    if (royaltyFee > 0) {
-      uint256 royaltyTotal = calculateRoyalty(royaltyFee, listedNft.price);
-
-      // Transfer royalty fee to collection owner
-      IERC20(_payToken).transferFrom(
-        msg.sender,
-        royaltyRecipient,
-        royaltyTotal
-      );
-      totalPrice -= royaltyTotal;
-    }
+    totalPrice = _handleRoyalty(_nft, list.payToken, offerPrice, totalPrice);
 
     // Calculate & Transfer platfrom fee
     uint256 platformFeeTotal = calculatePlatformFee(listedNft.price);
@@ -242,7 +230,7 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     );
   }
 
-  // @notice Offer listed NFT
+  // ---------------------------  OFFER NFT FEATURE  ------------------------
   function offerNFT(
     address _nft,
     uint256 _tokenId,
@@ -339,45 +327,13 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     uint256 offerPrice = offer.offerPrice;
     uint256 totalPrice = offerPrice;
 
-    if (nftFactory.isMakeByFactory(_nft)) {
-      (address royaltyRecipient, uint256 royaltyFee) = IRoyalty(_nft)
-        .getDefaultRoyaltyInfo();
+    totalPrice = _handleRoyalty(_nft, list.payToken, offerPrice, totalPrice);
 
-      if (royaltyFee > 0) {
-        uint256 royaltyTotal = calculateRoyalty(royaltyFee, offerPrice);
-        if (offer.payToken == nativeToken) {
-          (bool sentSeller, ) = list.seller.call{ value: royaltyTotal }("");
-          require(sentSeller, "Failed to send Ether");
-        } else {
-          IERC20(offer.payToken).transfer(royaltyRecipient, royaltyTotal);
-        }
+    uint256 _platformFee = calculatePlatformFee(totalPrice);
+    _sendToken(list.payToken, list.seller, totalPrice - _platformFee);
 
-        totalPrice -= royaltyTotal;
-      }
-    }
-
-    uint256 sellerReceive = totalPrice - calculatePlatformFee(offerPrice);
-    if (offer.payToken == nativeToken) {
-      (bool sentSeller, ) = list.seller.call{ value: sellerReceive }("");
-      require(sentSeller, "Failed to send Ether");
-    } else {
-      IERC20(offer.payToken).transfer(list.seller, sellerReceive);
-    }
-
-    address[] memory offerers = offererAddress[_nft][_tokenId];
-    for (uint256 i = 0; i < offerers.length; i++) {
-      address offerUser = offerers[i];
-      if (offerUser == _offerer) {
-        IERC721(list.nft).safeTransferFrom(
-          address(this),
-          offer.offerer,
-          list.tokenId
-        );
-        continue;
-      }
-      OfferNFT memory missOffer = offerNfts[_nft][_tokenId][offerUser];
-      _sendToken(missOffer.payToken, missOffer.offerer, missOffer.offerPrice);
-    }
+    // transfer NFT to wiiner and return fund to offerer
+    _handleOfferersAndTransferNFT(_nft, _tokenId, _offerer, list, offer);
 
     emit AcceptedNFT(
       offer.nft,
@@ -389,7 +345,7 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     );
   }
 
-  // @notice Create autcion
+  // ---------------------------  AUCTION NFT FEATURE  ------------------------
   function createAuction(
     address _nft,
     uint256 _tokenId,
@@ -432,7 +388,6 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     );
   }
 
-  // @notice Cancel auction
   function cancelAuction(
     address _nft,
     uint256 _tokenId
@@ -541,6 +496,22 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     );
   }
 
+  function removeNftOffer(
+    address _nft,
+    uint256 _tokenId,
+    address _offerer
+  ) internal {
+    address[] memory offerer = offererAddress[_nft][_tokenId];
+    uint256 userIndex = 0;
+    for (uint256 i = 0; i < offerer.length; i++) {
+      if (offerer[i] == _offerer) {
+        userIndex = i;
+      }
+    }
+
+    delete offererAddress[_nft][_tokenId][userIndex];
+  }
+
   // ----------------- UTILS FUNCTIONS --------------
   function calculatePlatformFee(uint256 _price) public view returns (uint256) {
     return (_price * platformFee) / 10000;
@@ -552,6 +523,69 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
   ) public pure returns (uint256) {
     return (_price * _royalty) / 10000;
   }
+
+  function _sendToken(address token, address to, uint256 amount) private {
+    if (token == nativeToken) {
+      (bool sent, ) = to.call{ value: amount }("");
+      require(sent, "Failed to send token");
+    } else {
+      require(IERC20(token).transfer(to, amount));
+    }
+  }
+
+  function _handleRoyalty(
+    address _nft,
+    address payToken,
+    uint256 totalPrice
+  ) private returns (uint256) {
+    if (nftFactory.isMakeByFactory(_nft)) {
+      // prettier-ignore
+      (
+        address royaltyRecipient,
+        uint256 royaltyFee
+      ) = IRoyalty(_nft).getDefaultRoyaltyInfo();
+
+      if (royaltyFee > 0) {
+        uint256 royaltyTotal = calculateRoyalty(royaltyFee, offerPrice);
+        _sendToken(payToken, royaltyRecipient, royaltyTotal);
+        totalPrice -= royaltyTotal;
+      }
+    }
+
+    return totalPrice;
+  }
+
+  function _handleOfferersAndTransferNFT(
+    address _nft,
+    uint256 _tokenId,
+    address _offerer,
+    ListNFT storage list,
+    OfferNFT storage offer
+  ) private {
+    address[] memory offerers = offererAddress[_nft][_tokenId];
+
+    for (uint256 i = 0; i < offerers.length; i++) {
+      address offerUser = offerers[i];
+
+      if (offerUser == _offerer) {
+        IERC721(list.nft).safeTransferFrom(
+          address(this),
+          offer.offerer,
+          list.tokenId
+        );
+        continue;
+      }
+
+      OfferNFT memory missOfferer = offerNfts[_nft][_tokenId][offerUser];
+      _sendToken(
+        missOfferer.payToken,
+        missOfferer.offerer,
+        missOfferer.offerPrice
+      );
+    }
+  }
+
+  // ----------------- GET FUNCTIONS --------------
 
   function getListedNFT(
     address _nft,
@@ -570,6 +604,19 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
     return payableToken[_payableToken];
   }
 
+  function getRoyalty(address _nft) internal view returns (address, uint256) {
+    address royaltyRecipient = address(0);
+    uint256 royaltyFee = 0;
+
+    if (nftFactory.isMakeByFactory(_nft)) {
+      (royaltyRecipient, royaltyFee) = IRoyalty(_nft).getDefaultRoyaltyInfo();
+    }
+
+    return (royaltyRecipient, royaltyFee);
+  }
+
+  // ----------------- ADMIn FUNCTIONS --------------
+
   function addPayableToken(address _token) external onlyOwner {
     require(_token != address(0), "invalid token");
     require(!payableToken[_token], "already payable token");
@@ -585,41 +632,5 @@ contract YuNftMarketplace is IMarketPlatform, Ownable, ReentrancyGuard {
   function changeFeeRecipient(address _feeRecipient) external onlyOwner {
     require(_feeRecipient != address(0), "can't be 0 address");
     feeRecipient = _feeRecipient;
-  }
-
-  function getRoyalty(address _nft) internal view returns (address, uint256) {
-    address royaltyRecipient = address(0);
-    uint256 royaltyFee = 0;
-
-    if (nftFactory.isMakeByFactory(_nft)) {
-      (royaltyRecipient, royaltyFee) = IRoyalty(_nft).getDefaultRoyaltyInfo();
-    }
-
-    return (royaltyRecipient, royaltyFee);
-  }
-
-  function _sendToken(address token, address to, uint256 amount) private {
-    if (token == nativeToken) {
-      (bool sent, ) = to.call{ value: amount }("");
-      require(sent, "Failed to send token");
-    } else {
-      require(IERC20(token).transfer(to, amount));
-    }
-  }
-
-  function removeNftOffer(
-    address _nft,
-    uint256 _tokenId,
-    address _offerer
-  ) internal {
-    address[] memory offerer = offererAddress[_nft][_tokenId];
-    uint256 userIndex = 0;
-    for (uint256 i = 0; i < offerer.length; i++) {
-      if (offerer[i] == _offerer) {
-        userIndex = i;
-      }
-    }
-
-    delete offererAddress[_nft][_tokenId][userIndex];
   }
 }

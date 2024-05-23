@@ -1,12 +1,8 @@
 //SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
+
 import "./NFTCollection.sol";
-
-interface IFactory {
-  function list(address owner) external view returns (address[] memory);
-
-  function isMakeByFactory(address collection) external view returns (bool);
-}
+import "./interfaces/IFactory.sol";
 
 contract NftFactory is IFactory {
   mapping(address => address[]) public user_collections;
